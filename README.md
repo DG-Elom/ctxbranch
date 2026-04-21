@@ -18,17 +18,26 @@ Claude Code sessions are linear. When you want to :
 
 ## Status
 
-🚧 **Pre-alpha — under active development.** See `docs/2026-04-21-ctxbranch-design.md` for the full design.
+**v0.1.0 — initial alpha release.** 97 tests, ruff-clean. Treat as a technology preview ; the CLI surface may still move between minor versions.
 
-## Install (when released)
+See :
+- [`docs/2026-04-21-ctxbranch-design.md`](docs/2026-04-21-ctxbranch-design.md) — design
+- [`docs/2026-04-21-implementation-plan.md`](docs/2026-04-21-implementation-plan.md) — TDD plan followed during build
+- [`docs/usage.md`](docs/usage.md) — day-to-day usage
+
+## Install
 
 ```bash
-pipx install ctxbranch
-ctxbranch install  # install slash-commands to ~/.claude/commands/
-ctxbranch doctor   # verify setup
+pipx install ctxbranch           # or: uv tool install ctxbranch
+ctxbranch install                # copy slash-commands to ~/.claude/commands/
+ctxbranch doctor                 # verify setup
 ```
 
-## Usage (preview)
+Prerequisites :
+- `claude` CLI (Claude Code) on PATH
+- `at` for pause/resume (`sudo apt install at` on Debian/Ubuntu)
+
+## Usage
 
 From inside Claude Code :
 
@@ -39,16 +48,22 @@ From inside Claude Code :
 /fork checkpoint "pre-compact"
 /merge
 /tree
+/pause 22:59
 ```
 
 From the shell :
 
 ```bash
+ctxbranch init                    # bootstrap the project's tree
 ctxbranch tree
+ctxbranch fork d-1 digression "check TTL"
+ctxbranch merge d-1
 ctxbranch resume main
-ctxbranch pause --until 22:59
+ctxbranch pause --until 22:59     # checkpoint + schedule auto-resume via `at`
 ctxbranch clean --thrown
 ```
+
+Full walkthrough : [`docs/usage.md`](docs/usage.md).
 
 ## Design
 
