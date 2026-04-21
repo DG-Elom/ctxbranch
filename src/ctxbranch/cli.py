@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -10,14 +11,22 @@ from rich.console import Console
 from rich.tree import Tree
 
 from ctxbranch import __version__
-from ctxbranch.core.claude_invoker import build_fork_command
+from ctxbranch.core.claude_invoker import (
+    ClaudeInvokerError,
+    build_fork_command,
+    headless_call,
+)
 from ctxbranch.core.state_manager import (
+    Branch,
     BranchStatus,
     Intent,
+    State,
     StateManager,
 )
+from ctxbranch.strategies import get_strategy
 
 CONSOLE = Console()
+MERGES_DIR = "merges"
 
 _STATUS_MARK = {
     BranchStatus.ACTIVE: "",
@@ -113,6 +122,75 @@ def fork(
 
 
 @main.command()
+@click.argument("branch_name", required=False)
+@click.option(
+    "--into",
+    default=None,
+    help="Parent branch to merge into (defaults to the branch's own parent).",
+)
+@click.option(
+    "--timeout",
+    default=180,
+    show_default=True,
+    help="Timeout (seconds) for the headless summary call.",
+)
+@click.pass_context
+def merge(
+    ctx: click.Context,
+    branch_name: str | None,
+    into: str | None,
+    timeout: int,
+) -> None:
+    """Merge a branch back into its parent via an intent-driven summary."""
+    project_root: Path = ctx.obj["project_root"]
+    sm = StateManager(project_root)
+    state = sm.load()
+
+    branch = _resolve_branch_for_merge(state, branch_name)
+    parent_name = into or branch.parent
+    if parent_name is None:
+        raise click.ClickException(
+            f"Branch {branch.name!r} has no parent — it is a root and cannot be merged."
+        )
+    if parent_name not in state.branches:
+        raise click.ClickException(f"Parent branch {parent_name!r} does not exist.")
+    if branch.status == BranchStatus.MERGED:
+        raise click.ClickException(f"Branch {branch.name!r} is already merged.")
+    if branch.intent is None:
+        raise click.ClickException(
+            f"Branch {branch.name!r} has no intent — cannot pick a merge strategy."
+        )
+
+    strategy = get_strategy(branch.intent)
+    prompt = strategy.prompt(branch)
+
+    payload, raw_text, fallback = _execute_merge_call(
+        branch=branch, prompt=prompt, schema=strategy.schema, timeout=timeout
+    )
+
+    merge_id = f"merge-{uuid.uuid4().hex[:10]}"
+    artifact = _write_merge_artifact(
+        project_root=project_root,
+        merge_id=merge_id,
+        branch=branch,
+        payload=payload,
+        raw_text=raw_text,
+        fallback=fallback,
+    )
+
+    sm.merge_branch(branch.name, merge_id=merge_id)
+    sm.switch_branch(parent_name)
+
+    CONSOLE.print(
+        f"[green]✓[/green] Branch [bold]{branch.name}[/bold] merged into "
+        f"[bold]{parent_name}[/bold] ([dim]{merge_id}[/dim])."
+    )
+    CONSOLE.print(f"  artifact: {artifact.relative_to(project_root)}")
+    CONSOLE.print()
+    CONSOLE.print(strategy.render(branch=branch, payload=payload, raw_text=raw_text))
+
+
+@main.command()
 @click.pass_context
 def tree(ctx: click.Context) -> None:
     """Render the branch tree for this project."""
@@ -126,7 +204,6 @@ def tree(ctx: click.Context) -> None:
 
     roots = [b for b in state.branches.values() if b.parent is None]
     if not roots:
-        # Defensive : no root found (shouldn't happen), render flat
         roots = list(state.branches.values())
 
     rich_tree = Tree(
@@ -139,7 +216,76 @@ def tree(ctx: click.Context) -> None:
     CONSOLE.print(rich_tree)
 
 
-def _attach(parent_node: Tree, branch_name: str, state, current: str) -> None:
+def _resolve_branch_for_merge(state: State, branch_name: str | None) -> Branch:
+    name = branch_name or state.current_branch
+    if name not in state.branches:
+        raise click.ClickException(f"Branch {name!r} does not exist.")
+    return state.branches[name]
+
+
+def _execute_merge_call(
+    branch: Branch,
+    prompt: str,
+    schema: dict | None,
+    timeout: int,
+) -> tuple[dict | None, str | None, str | None]:
+    """Try structured schema call first, fall back to text on failure.
+
+    Returns (payload, raw_text, fallback_mode).
+    """
+    if schema is not None:
+        try:
+            result = headless_call(
+                session_id=branch.session_id,
+                prompt=prompt,
+                system_prompt=None,
+                json_schema=schema,
+                timeout=timeout,
+            )
+            return result.parsed, None, None
+        except ClaudeInvokerError as exc:
+            CONSOLE.print(f"[yellow]⚠[/yellow] Schema mode failed ({exc}) — retrying in text mode.")
+
+    result = headless_call(
+        session_id=branch.session_id,
+        prompt=prompt,
+        system_prompt=None,
+        json_schema=None,
+        timeout=timeout,
+    )
+    return None, result.raw_text, "text"
+
+
+def _write_merge_artifact(
+    project_root: Path,
+    merge_id: str,
+    branch: Branch,
+    payload: dict | None,
+    raw_text: str | None,
+    fallback: str | None,
+) -> Path:
+    merges_dir = project_root / "ctxbranch" / MERGES_DIR
+    merges_dir.mkdir(parents=True, exist_ok=True)
+    artifact = merges_dir / f"{merge_id}.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "merge_id": merge_id,
+                "branch": branch.name,
+                "intent": branch.intent.value if branch.intent else None,
+                "parent": branch.parent,
+                "payload": payload,
+                "raw_text": raw_text,
+                "fallback": fallback,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return artifact
+
+
+def _attach(parent_node: Tree, branch_name: str, state: State, current: str) -> None:
     branch = state.branches[branch_name]
     label_parts = [f"[bold]{branch.name}[/bold]"]
     if branch_name == current:
