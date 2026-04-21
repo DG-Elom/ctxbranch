@@ -191,6 +191,113 @@ def merge(
 
 
 @main.command()
+@click.argument("branch_name")
+@click.option(
+    "--archive",
+    is_flag=True,
+    help="Keep the underlying .jsonl and branch entry — just mark thrown.",
+)
+@click.pass_context
+def throw(ctx: click.Context, branch_name: str, archive: bool) -> None:
+    """Discard a branch (mark it thrown)."""
+    project_root: Path = ctx.obj["project_root"]
+    sm = StateManager(project_root)
+    state = sm.load()
+    if branch_name not in state.branches:
+        raise click.ClickException(f"Unknown branch {branch_name!r}.")
+
+    branch = state.branches[branch_name]
+    sm.throw_branch(branch_name)
+    if state.current_branch == branch_name and branch.parent in state.branches:
+        sm.switch_branch(branch.parent)
+
+    CONSOLE.print(f"[yellow]✓[/yellow] Branch [bold]{branch_name}[/bold] thrown.")
+    if archive:
+        CONSOLE.print("[dim]  Archived — entry and .jsonl preserved for audit.[/dim]")
+
+
+@main.command()
+@click.option(
+    "--thrown",
+    "clean_thrown",
+    is_flag=True,
+    help="Remove all thrown branches from the tree.",
+)
+@click.option(
+    "--older-than",
+    "older_than_days",
+    type=int,
+    default=None,
+    help="Remove merged branches older than N days.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would be removed without mutating state.",
+)
+@click.pass_context
+def clean(
+    ctx: click.Context,
+    clean_thrown: bool,
+    older_than_days: int | None,
+    dry_run: bool,
+) -> None:
+    """Garbage-collect thrown or old-merged branches from the tree."""
+    if not clean_thrown and older_than_days is None:
+        raise click.ClickException("Nothing to do — pass --thrown and/or --older-than <days>.")
+
+    project_root: Path = ctx.obj["project_root"]
+    sm = StateManager(project_root)
+    state = sm.load()
+
+    victims = _select_clean_victims(state, clean_thrown, older_than_days)
+
+    if not victims:
+        CONSOLE.print("[dim]Nothing to clean.[/dim]")
+        return
+
+    for name in victims:
+        b = state.branches[name]
+        CONSOLE.print(
+            f"  [red]-[/red] {name} [dim]({b.status.value}, merged_at={b.merged_at or '-'})[/dim]"
+        )
+
+    if dry_run:
+        CONSOLE.print("[dim]Dry run — nothing removed.[/dim]")
+        return
+
+    for name in victims:
+        sm.remove_branch(name)
+
+    CONSOLE.print(f"[green]✓[/green] Removed {len(victims)} branch(es) from the tree.")
+
+
+@main.command()
+@click.argument("branch_name")
+@click.pass_context
+def resume(ctx: click.Context, branch_name: str) -> None:
+    """Emit the `claude --resume` command for a branch and set it as current."""
+    project_root: Path = ctx.obj["project_root"]
+    sm = StateManager(project_root)
+    state = sm.load()
+    if branch_name not in state.branches:
+        raise click.ClickException(f"Unknown branch {branch_name!r}.")
+
+    branch = state.branches[branch_name]
+    sm.switch_branch(branch_name)
+
+    if branch.status == BranchStatus.THROWN:
+        CONSOLE.print(
+            f"[yellow]⚠[/yellow] Branch [bold]{branch_name}[/bold] was thrown — resuming it anyway."
+        )
+
+    cmd = ["claude", "--resume", branch.session_id]
+    CONSOLE.print(f"[green]✓[/green] Current branch set to [bold]{branch_name}[/bold].")
+    CONSOLE.print("[dim]To resume interactively :[/dim]")
+    CONSOLE.print(f"  [cyan]{' '.join(cmd)}[/cyan]")
+
+
+@main.command()
 @click.pass_context
 def tree(ctx: click.Context) -> None:
     """Render the branch tree for this project."""
@@ -214,6 +321,29 @@ def tree(ctx: click.Context) -> None:
         _attach(rich_tree, root.name, state, state.current_branch)
 
     CONSOLE.print(rich_tree)
+
+
+def _select_clean_victims(
+    state: State,
+    clean_thrown: bool,
+    older_than_days: int | None,
+) -> list[str]:
+    from datetime import UTC, datetime
+
+    victims: list[str] = []
+    now = datetime.now(UTC)
+    for name, branch in state.branches.items():
+        if clean_thrown and branch.status == BranchStatus.THROWN:
+            victims.append(name)
+            continue
+        if older_than_days is not None and branch.status == BranchStatus.MERGED:
+            if branch.merged_at is None:
+                continue
+            merged_dt = datetime.fromisoformat(branch.merged_at.replace("Z", "+00:00"))
+            age = now - merged_dt
+            if age.days >= older_than_days:
+                victims.append(name)
+    return victims
 
 
 def _resolve_branch_for_merge(state: State, branch_name: str | None) -> Branch:

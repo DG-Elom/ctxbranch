@@ -136,6 +136,29 @@ class StateManager:
         state.current_branch = name
         self.save()
 
+    def remove_branch(self, name: str) -> None:
+        """Remove a branch entry from state entirely.
+
+        Does not touch the underlying `.jsonl` file — only the branch tree metadata.
+        If the branch has children, they become orphans (their `parent` is cleared).
+        If the branch is the current one, current_branch falls back to its parent or `main`.
+        """
+        state = self._ensure_loaded()
+        if name not in state.branches:
+            raise ValueError(f"unknown branch {name!r}")
+        branch = state.branches[name]
+        if branch.parent and branch.parent in state.branches:
+            state.branches[branch.parent].children = [
+                c for c in state.branches[branch.parent].children if c != name
+            ]
+        for child_name in branch.children:
+            if child_name in state.branches:
+                state.branches[child_name].parent = None
+        if state.current_branch == name:
+            state.current_branch = branch.parent or DEFAULT_BRANCH_NAME
+        del state.branches[name]
+        self.save()
+
     def _ensure_loaded(self) -> State:
         if self._state is None:
             return self.load()
