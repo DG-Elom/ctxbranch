@@ -16,6 +16,7 @@ from ctxbranch.core.claude_invoker import (
     build_fork_command,
     headless_call,
 )
+from ctxbranch.core.scheduler import AtNotAvailableError, schedule_at
 from ctxbranch.core.state_manager import (
     Branch,
     BranchStatus,
@@ -24,9 +25,12 @@ from ctxbranch.core.state_manager import (
     StateManager,
 )
 from ctxbranch.strategies import get_strategy
+from ctxbranch.strategies.checkpoint import CheckpointStrategy
 
 CONSOLE = Console()
 MERGES_DIR = "merges"
+PAUSES_DIR = "pauses"
+MAX_RESUMES = 3
 
 _STATUS_MARK = {
     BranchStatus.ACTIVE: "",
@@ -298,6 +302,111 @@ def resume(ctx: click.Context, branch_name: str) -> None:
 
 
 @main.command()
+@click.option(
+    "--until",
+    "until",
+    required=True,
+    help="Time expression understood by `at` (e.g. 22:59, 'now + 4 hours').",
+)
+@click.option(
+    "--branch",
+    "branch_name",
+    default=None,
+    help="Branch to pause (default : current).",
+)
+@click.option(
+    "--timeout",
+    default=180,
+    show_default=True,
+    help="Timeout for the checkpoint headless call.",
+)
+@click.pass_context
+def pause(
+    ctx: click.Context,
+    until: str,
+    branch_name: str | None,
+    timeout: int,
+) -> None:
+    """Checkpoint a branch and schedule a `claude --resume` at the given time."""
+    project_root: Path = ctx.obj["project_root"]
+    sm = StateManager(project_root)
+    state = sm.load()
+    name = branch_name or state.current_branch
+    if name not in state.branches:
+        raise click.ClickException(f"Unknown branch {name!r}.")
+    branch = state.branches[name]
+
+    if branch.resume_count >= MAX_RESUMES:
+        raise click.ClickException(
+            f"Branch {name!r} has reached the resume limit ({MAX_RESUMES}) — "
+            "intervene manually before scheduling another auto-resume."
+        )
+
+    strategy = CheckpointStrategy()
+    prompt = strategy.prompt(branch)
+
+    CONSOLE.print(f"[dim]Producing checkpoint for {name!r}…[/dim]")
+    try:
+        result = headless_call(
+            session_id=branch.session_id,
+            prompt=prompt,
+            system_prompt=None,
+            json_schema=strategy.schema,
+            timeout=timeout,
+        )
+        payload = result.parsed
+        raw_text = None
+    except ClaudeInvokerError as exc:
+        CONSOLE.print(
+            f"[yellow]⚠[/yellow] Schema checkpoint failed ({exc}) — falling back to text."
+        )
+        result = headless_call(
+            session_id=branch.session_id,
+            prompt=prompt,
+            system_prompt=None,
+            json_schema=None,
+            timeout=timeout,
+        )
+        payload = None
+        raw_text = result.raw_text
+
+    pause_id = f"pause-{uuid.uuid4().hex[:10]}"
+    artifact, script_path, log_path = _write_pause_artifacts(
+        project_root=project_root,
+        pause_id=pause_id,
+        branch=branch,
+        payload=payload,
+        raw_text=raw_text,
+        when=until,
+        strategy=strategy,
+    )
+
+    try:
+        job_id = schedule_at(str(script_path), until, log_path=str(log_path))
+    except AtNotAvailableError as exc:
+        raise click.ClickException(
+            f"Cannot schedule resume : {exc}. Checkpoint saved at "
+            f"{artifact.relative_to(project_root)} — you can resume manually."
+        ) from exc
+
+    # Persist the at_job_id by re-writing the artifact (can't mutate Path in place).
+    _update_pause_artifact_with_job(artifact, job_id)
+    sm.record_pause(name, pause_id)
+
+    CONSOLE.print(
+        f"[green]✓[/green] Paused branch [bold]{name}[/bold] — "
+        f"`at` job [bold]{job_id}[/bold] scheduled for [bold]{until}[/bold]."
+    )
+    CONSOLE.print(f"  checkpoint: {artifact.relative_to(project_root)}")
+    CONSOLE.print(f"  resume script: {script_path}")
+    CONSOLE.print(f"  log: {log_path}")
+    CONSOLE.print(
+        f"[dim]Cancel with : [cyan]atrm {job_id}[/cyan] ; attempts left : "
+        f"{MAX_RESUMES - branch.resume_count - 1}[/dim]"
+    )
+
+
+@main.command()
 @click.pass_context
 def tree(ctx: click.Context) -> None:
     """Render the branch tree for this project."""
@@ -321,6 +430,64 @@ def tree(ctx: click.Context) -> None:
         _attach(rich_tree, root.name, state, state.current_branch)
 
     CONSOLE.print(rich_tree)
+
+
+def _write_pause_artifacts(
+    project_root: Path,
+    pause_id: str,
+    branch: Branch,
+    payload: dict | None,
+    raw_text: str | None,
+    when: str,
+    strategy: CheckpointStrategy,
+) -> tuple[Path, Path, Path]:
+    """Write the pause JSON + the bash resume script + prepare the log path.
+
+    Returns (artifact, script_path, log_path).
+    """
+    pauses_dir = project_root / "ctxbranch" / PAUSES_DIR
+    pauses_dir.mkdir(parents=True, exist_ok=True)
+    artifact = pauses_dir / f"{pause_id}.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "pause_id": pause_id,
+                "branch": branch.name,
+                "session_id": branch.session_id,
+                "payload": payload,
+                "raw_text": raw_text,
+                "when": when,
+                "at_job_id": None,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
+    checkpoint_md = strategy.render(branch=branch, payload=payload, raw_text=raw_text)
+    script_path = Path(f"/tmp/ctxbranch-resume-{pause_id}.sh")
+    log_path = Path(f"/tmp/ctxbranch-resume-{pause_id}.log")
+
+    # Escape single quotes in the checkpoint for safe embedding in the heredoc.
+    checkpoint_escaped = checkpoint_md.replace("'", "'\\''")
+
+    script = f"""#!/bin/bash
+set -e
+cd '{project_root}'
+claude --resume {branch.session_id} \\
+  --permission-mode auto \\
+  --append-system-prompt '{checkpoint_escaped}' \\
+  -p 'Resume the work captured in the checkpoint above. Continue autonomously.'
+"""
+    script_path.write_text(script)
+    script_path.chmod(0o755)
+    return artifact, script_path, log_path
+
+
+def _update_pause_artifact_with_job(artifact: Path, job_id: str) -> None:
+    data = json.loads(artifact.read_text())
+    data["at_job_id"] = job_id
+    artifact.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def _select_clean_victims(

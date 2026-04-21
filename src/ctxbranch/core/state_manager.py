@@ -41,6 +41,8 @@ class Branch(BaseModel):
     children: list[str] = Field(default_factory=list)
     merged_at: str | None = None
     merge_id: str | None = None
+    resume_count: int = 0
+    last_pause_id: str | None = None
 
 
 class State(BaseModel):
@@ -126,6 +128,15 @@ class StateManager:
         state = self._ensure_loaded()
         branch = self._get_branch(state, name)
         branch.status = BranchStatus.THROWN
+        self.save()
+        return branch
+
+    def record_pause(self, branch_name: str, pause_id: str) -> Branch:
+        """Increment resume_count and store last_pause_id on the branch."""
+        state = self._ensure_loaded()
+        branch = self._get_branch(state, branch_name)
+        branch.resume_count += 1
+        branch.last_pause_id = pause_id
         self.save()
         return branch
 
