@@ -1,0 +1,3 @@
+"""ctxbranch — git-like branching for Claude Code conversations."""
+
+__version__ = "0.1.0.dev0"
