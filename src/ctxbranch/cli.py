@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import uuid
 from pathlib import Path
 
@@ -13,10 +15,18 @@ from rich.tree import Tree
 from ctxbranch import __version__
 from ctxbranch.core.claude_invoker import (
     ClaudeInvokerError,
+    ClaudeNotFoundError,
     build_fork_command,
     headless_call,
 )
-from ctxbranch.core.scheduler import AtNotAvailableError, schedule_at
+from ctxbranch.core.claude_invoker import (
+    version as claude_version,
+)
+from ctxbranch.core.scheduler import (
+    AtNotAvailableError,
+    is_at_available,
+    schedule_at,
+)
 from ctxbranch.core.state_manager import (
     Branch,
     BranchStatus,
@@ -31,6 +41,7 @@ CONSOLE = Console()
 MERGES_DIR = "merges"
 PAUSES_DIR = "pauses"
 MAX_RESUMES = 3
+BUNDLED_SLASH_COMMANDS_DIR = Path(__file__).parent / "slash_commands"
 
 _STATUS_MARK = {
     BranchStatus.ACTIVE: "",
@@ -56,6 +67,39 @@ def main(ctx: click.Context, project_root: Path | None) -> None:
     """Git-like branching for Claude Code conversations."""
     ctx.ensure_object(dict)
     ctx.obj["project_root"] = Path(project_root) if project_root else Path.cwd()
+
+
+@main.command()
+@click.option(
+    "--session-id",
+    default=None,
+    help="Session UUID for the initial `main` branch. Falls back to $CLAUDE_SESSION_ID.",
+)
+@click.pass_context
+def init(ctx: click.Context, session_id: str | None) -> None:
+    """Initialize this project with a `main` branch."""
+    project_root: Path = ctx.obj["project_root"]
+    sm = StateManager(project_root)
+    state = sm.load()
+
+    sid = session_id or os.environ.get("CLAUDE_SESSION_ID")
+    if not sid:
+        raise click.ClickException(
+            "No session id — pass --session-id <uuid> or set $CLAUDE_SESSION_ID."
+        )
+
+    if "main" in state.branches:
+        CONSOLE.print("[dim]Already initialized — main branch exists.[/dim]")
+        return
+
+    sm.add_branch(
+        name="main",
+        session_id=sid,
+        parent=None,
+        intent=None,
+        description=None,
+    )
+    CONSOLE.print(f"[green]✓[/green] Initialized — main branch tracks session [bold]{sid}[/bold].")
 
 
 @main.command()
@@ -404,6 +448,82 @@ def pause(
         f"[dim]Cancel with : [cyan]atrm {job_id}[/cyan] ; attempts left : "
         f"{MAX_RESUMES - branch.resume_count - 1}[/dim]"
     )
+
+
+@main.command()
+@click.pass_context
+def doctor(ctx: click.Context) -> None:
+    """Health check : claude CLI, at scheduler, state integrity."""
+    project_root: Path = ctx.obj["project_root"]
+    issues: list[str] = []
+
+    try:
+        v = claude_version()
+        CONSOLE.print(f"[green]✓[/green] claude CLI : [bold]{v}[/bold]")
+    except ClaudeNotFoundError as exc:
+        issues.append(f"claude CLI missing ({exc})")
+        CONSOLE.print(f"[red]✗[/red] claude CLI missing : {exc}")
+    except ClaudeInvokerError as exc:
+        issues.append(f"claude CLI errored ({exc})")
+        CONSOLE.print(f"[red]✗[/red] claude CLI errored : {exc}")
+
+    if is_at_available():
+        CONSOLE.print("[green]✓[/green] `at` scheduler : present")
+    else:
+        issues.append("`at` scheduler missing")
+        CONSOLE.print(
+            "[red]✗[/red] `at` missing — `sudo apt install at` (or equivalent) to enable pause/resume"
+        )
+
+    sm = StateManager(project_root)
+    try:
+        state = sm.load()
+        CONSOLE.print(
+            f"[green]✓[/green] state : {len(state.branches)} branch(es), current=[bold]{state.current_branch}[/bold]"
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        issues.append(f"state load failed : {exc}")
+        CONSOLE.print(f"[red]✗[/red] state load failed : {exc}")
+
+    if issues:
+        raise click.ClickException(f"{len(issues)} issue(s) : {'; '.join(issues)}")
+
+
+@main.command()
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite existing slash-command files without prompting.",
+)
+@click.pass_context
+def install(ctx: click.Context, force: bool) -> None:
+    """Install Claude Code slash-commands (/fork, /merge, /throw, /tree)."""
+    target = _slash_commands_target()
+    target.mkdir(parents=True, exist_ok=True)
+
+    if not BUNDLED_SLASH_COMMANDS_DIR.is_dir():
+        raise click.ClickException(
+            f"bundled slash-commands directory missing : {BUNDLED_SLASH_COMMANDS_DIR} "
+            "(packaging issue — please file a bug)"
+        )
+
+    copied = 0
+    skipped = 0
+    for src in BUNDLED_SLASH_COMMANDS_DIR.glob("*.md"):
+        dst = target / src.name
+        if dst.exists() and not force:
+            skipped += 1
+            continue
+        shutil.copy2(src, dst)
+        copied += 1
+
+    CONSOLE.print(f"[green]✓[/green] Installed {copied} slash-command(s) to [bold]{target}[/bold].")
+    if skipped:
+        CONSOLE.print(f"[dim]{skipped} skipped (already present, use --force to overwrite).[/dim]")
+
+
+def _slash_commands_target() -> Path:
+    return Path.home() / ".claude" / "commands"
 
 
 @main.command()
