@@ -4,17 +4,26 @@ from __future__ import annotations
 
 from ctxbranch.core.state_manager import Intent
 
+from .ab import AbStrategy
 from .base import Strategy
+from .checkpoint import CheckpointStrategy
 from .digression import DigressionStrategy
+from .hypothesis import HypothesisStrategy
 
 __all__ = [
+    "AbStrategy",
+    "CheckpointStrategy",
     "DigressionStrategy",
+    "HypothesisStrategy",
     "Strategy",
     "get_strategy",
 ]
 
 _REGISTRY: dict[Intent, type[Strategy]] = {
     Intent.DIGRESSION: DigressionStrategy,
+    Intent.HYPOTHESIS: HypothesisStrategy,
+    Intent.AB: AbStrategy,
+    Intent.CHECKPOINT: CheckpointStrategy,
 }
 
 
